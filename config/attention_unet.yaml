@@ -1,0 +1,114 @@
+# Single experiment config for Kvasir-SEG AttentionUNet2d
+
+train:
+  run_name: attention_unet_03_18
+  output_root: checkpoints
+
+  seed: 42
+  device: gpu
+  batch_size: 8
+  epochs: 120
+  log_every: 5
+  threshold: 0.2
+
+  monitor: valid_dice
+  monitor_mode: max
+  save_best: true
+  save_last: true
+  resume_from: null
+
+  # Optional debug caps for quick smoke tests. Use null for full epochs.
+  max_train_steps_per_epoch: null
+  max_val_steps_per_epoch: null
+
+  optimizer:
+    name: adamw
+    lr: 5.0e-5
+    weight_decay: 5.0e-5
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    momentum: 0.9
+
+  scheduler:
+    name: plateau     # none | cosine | step | plateau
+    monitor: valid_loss # used only by plateau
+    mode: min
+    t_max: null       # used only by cosine
+    eta_min: 1.0e-6
+    step_size: 10
+    gamma: 0.5
+    factor: 0.5
+    patience: 6
+    min_lr: 1.0e-6
+
+  loss:
+    bce_weight: 0.25
+    dice_weight: 0.75
+    aux_weight: 0.1
+    dice_smooth: 1.0
+
+model:
+  in_channels: 3       # RGB
+  out_channels: 1      # binary mask
+
+  norm: batch          # batch | group | instance | none
+  act: relu            # relu | leaky_relu | gelu | silu
+  downsample_mode: maxpool   # conv | maxpool | avgpool
+  upsample_mode: bilinear    # transpose | bilinear | nearest
+  deep_supervision: true
+  align_corners: false
+  bias: null           # null = auto (false when norm != none)
+  stem_channels: null  # null = encoder_stages[0].channels
+  final_kernel_size: 1
+
+  encoder_stages:
+    - channels: 64
+      num_blocks: 2
+      kernel_size: 3
+      dilation: 1
+      use_attention: false
+      dropout: 0.0
+    - channels: 128
+      num_blocks: 2
+      kernel_size: 3
+      dilation: 1
+      use_attention: false
+      dropout: 0.0
+    - channels: 256
+      num_blocks: 2
+      kernel_size: 3
+      dilation: 1
+      use_attention: false
+      dropout: 0.0
+    - channels: 512
+      num_blocks: 2
+      kernel_size: 3
+      dilation: 1
+      use_attention: false
+      dropout: 0.0
+
+  decoder_stages: null
+
+  bottleneck:
+    channels: 1024
+    num_blocks: 2
+    kernel_size: 3
+    dilation: 1
+    use_attention: false
+    dropout: 0.0
+
+  attention:
+    enabled: true
+    mode: additive
+    gate_activation: relu
+    attention_activation: sigmoid
+    use_grid_attention: true
+    inter_channels: null
+    attention_channels: 1
+    resample_mode: bilinear
+    gate_on_skips: null
+    skip_low_level_gates: false
+    use_multi_scale_gating: true
+    project_skip_with_1x1: true
+    project_gating_with_1x1: true
+    init_pass_through: true
