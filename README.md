@@ -165,9 +165,9 @@ The experiment configuration is stored in [`config/attention_unet.yaml`](config/
 
 The training objective combines binary cross-entropy and soft Dice loss, with optional auxiliary supervision from deep supervision heads:
 
-\[
+$$
 \mathcal{L} = 0.25 \cdot \mathcal{L}_{BCE} + 0.75 \cdot \mathcal{L}_{Dice} + 0.10 \cdot \mathcal{L}_{aux}
-\]
+$$
 
 This weighting intentionally biases training toward overlap quality rather than pure pixel-wise calibration.
 
