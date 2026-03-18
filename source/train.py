@@ -896,13 +896,14 @@ def load_model_from_bundle(
 ):
     config_path = Path(config_path)
     bundle_dir = Path(bundle_dir)
-    if not _has_checkpoint_bundle(bundle_dir):
-        raise FileNotFoundError(f"Checkpoint bundle is incomplete: {bundle_dir}")
+    model_path = bundle_dir / "model.safetensors"
+    if not model_path.exists():
+        raise FileNotFoundError(f"Checkpoint model not found: {model_path}")
     train_config = load_train_config(config_path)
     target_device = train_config.device if device is None else device
     model_config = load_model_config(config_path)
     model = build_model(model_config).to(target_device)
-    model.load_state_dict(lucid.load(bundle_dir / "model.safetensors"))
+    model.load_state_dict(lucid.load(model_path))
     model.eval()
     return model, train_config, bundle_dir
 
@@ -1161,6 +1162,259 @@ def plot_prediction_grid(
         fontsize=14,
     )
     fig.tight_layout()
+    return fig
+
+
+def _forward_with_attention_taps(model: nn.Module, x) -> tuple[Any, list[Any | None]]:
+    """Run AttentionUNet2d forward while retaining gated skip tensors for attribution."""
+    if not hasattr(model, "attention_gates"):
+        raise TypeError("Model does not expose attention gates.")
+
+    input_size = x.shape[-2:]
+    x = model.stem(x)
+
+    skips: list[Any] = []
+    for idx, stage in enumerate(model.encoder):
+        x = stage(x)
+        skips.append(x)
+        if idx < len(model.downsamplers):
+            x = model.downsamplers[idx](x)
+
+    x = model.bottleneck(x)
+    aux_outputs: list[Any] = []
+    gated_skips: list[Any | None] = []
+    decode_skips = list(reversed(skips[:-1]))
+
+    for idx, (gate, upsample, stage, skip) in enumerate(
+        zip(model.attention_gates, model.upsamplers, model.decoder, decode_skips)
+    ):
+        if hasattr(gate, "psi") and hasattr(gate, "coeff_activation"):
+            theta_x = gate.theta_x(skip)
+            phi_g = gate.phi_g(x)
+
+            if gate.gate_config.use_grid_attention:
+                phi_g = gate._resize(phi_g, theta_x.shape[-2:])
+            else:
+                phi_g = lucid.mean(phi_g, axis=(-2, -1), keepdims=True)
+                phi_g = lucid.broadcast_to(phi_g, theta_x.shape)
+
+            fused = gate.activation(theta_x + phi_g)
+            alpha = gate.coeff_activation(gate.psi(fused))
+            alpha = gate._resize(alpha, skip.shape[-2:])
+            gated_skip = alpha * skip
+            gated_skip.keep_grad = True
+            gated_skips.append(gated_skip)
+        else:
+            gated_skip = gate(skip, x)
+            gated_skips.append(None)
+
+        x = upsample(x, target_size=gated_skip.shape[-2:])
+        x = model._merge_skip(x, gated_skip)
+        x = stage(x)
+
+        if model.config.deep_supervision and idx < len(model.aux_heads):
+            aux = model.aux_heads[idx](x)
+            aux_outputs.append(model._resize_to_input(aux, input_size))
+
+    out = model.head(x)
+    out = model._resize_to_input(out, input_size)
+
+    outputs = {"out": out, "aux": aux_outputs} if model.config.deep_supervision else out
+    return outputs, gated_skips
+
+
+def plot_attention_maps(
+    config_path: str | Path,
+    *,
+    which: str = "latest",
+    split: str = "val",
+    n: int = 4,
+    seed: int = 13,
+    indices: Sequence[int] | None = None,
+    threshold: float | None = None,
+    device: str | None = None,
+    map_percentiles: tuple[float, float] = (1.0, 99.0),
+) -> plt.Figure:
+    """Visualize class-conditional gated-skip contribution maps for selected samples."""
+    model, train_config, _ = load_model_from_checkpoint(
+        config_path,
+        which=which,
+        device=device,
+    )
+    ds = KvasirSegDataset(split, augment=False)
+    if indices is None:
+        rng = np.random.default_rng(seed)
+        selected_indices = rng.choice(len(ds), size=min(n, len(ds)), replace=False)
+    else:
+        selected_indices = np.asarray(indices, dtype=np.int32)
+        if selected_indices.ndim != 1 or len(selected_indices) == 0:
+            raise ValueError("indices must be a non-empty 1D sequence")
+        if np.any(selected_indices < 0) or np.any(selected_indices >= len(ds)):
+            raise IndexError("indices contain values outside the dataset range")
+
+    pred_threshold = train_config.threshold if threshold is None else float(threshold)
+    enabled_gate_ids = [
+        i for i, gate in enumerate(model.attention_gates) if hasattr(gate, "psi")
+    ]
+
+    ncols = 3 + len(enabled_gate_ids)
+    fig, axes = plt.subplots(
+        len(selected_indices),
+        ncols,
+        figsize=(3.5 * ncols, 3.2 * len(selected_indices)),
+        squeeze=False,
+    )
+    fig.subplots_adjust(right=0.92, wspace=0.06, hspace=0.08)
+
+    col_titles = ["Image", "GT Overlay", "Pred Overlay"] + [
+        f"Gate {gate_idx + 1}" for gate_idx in enabled_gate_ids
+    ]
+    for col, title in enumerate(col_titles):
+        axes[0, col].set_title(title, fontsize=11, fontweight="bold")
+
+    sample_payloads: list[dict[str, Any]] = []
+    gate_maps: dict[int, list[np.ndarray]] = {gate_idx: [] for gate_idx in enabled_gate_ids}
+
+    for idx in selected_indices:
+        for param in model.parameters():
+            param.zero_grad()
+        image_t, mask_t = ds[int(idx)]
+        batch = lucid.stack((image_t,), axis=0).to(model.device)
+        outputs, gated_skips = _forward_with_attention_taps(model, batch)
+
+        logits, _ = _extract_logits(outputs)
+        logits_np = _to_numpy_float32(logits)
+        probs = 1.0 / (1.0 + np.exp(-np.clip(logits_np[0, 0], -60.0, 60.0)))
+        pred = (probs >= pred_threshold).astype(np.float32)
+        target = _to_numpy_float32(mask_t)[0]
+        intersection = float((pred * target).sum())
+        dice = (2.0 * intersection + 1e-7) / (float(pred.sum() + target.sum()) + 1e-7)
+
+        # Use the predicted foreground region as a constant spatial target so the
+        # attribution map answers: "which gated skip evidence supported the current
+        # foreground segmentation decision?"
+        score_mask = pred[np.newaxis, np.newaxis, ...].astype(np.float32)
+        if score_mask.sum() <= 0:
+            # Fallback for rare empty predictions: use top confident pixels.
+            cutoff = float(np.percentile(probs, 95.0))
+            score_mask = (probs[np.newaxis, np.newaxis, ...] >= cutoff).astype(np.float32)
+        score_mask_t = lucid.to_tensor(score_mask).to(logits.device)
+        score = lucid.sum(logits * score_mask_t) / max(float(score_mask.sum()), 1.0)
+        score.backward(retain_grad=True)
+
+        attention_maps: list[np.ndarray | None] = []
+        for gate_idx, gated_skip in enumerate(gated_skips):
+            if gated_skip is None:
+                attention_maps.append(None)
+                continue
+
+            if gated_skip.grad is None:
+                attention_maps.append(None)
+                continue
+
+            grad_t = lucid.to_tensor(np.array(gated_skip.grad, dtype=np.float32)).to(
+                gated_skip.device
+            )
+            contrib = F.relu(
+                lucid.sum(gated_skip * grad_t, axis=1, keepdims=True)
+            )
+            contrib = F.interpolate(
+                contrib,
+                size=logits.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+            attention_maps.append(_to_numpy_float32(contrib)[:, 0])
+
+        image = _denorm_image(_to_numpy_float32(image_t))
+        gt_overlay = _blend_mask(image, target, color=(1.0, 0.2, 0.2), alpha=0.35)
+        pred_overlay = _blend_mask(gt_overlay, pred, color=(0.15, 0.8, 0.25), alpha=0.30)
+
+        sample_payloads.append(
+            {
+                "idx": int(idx),
+                "dice": float(dice),
+                "image": image,
+                "gt_overlay": gt_overlay,
+                "pred_overlay": pred_overlay,
+                "attention_maps": attention_maps,
+            }
+        )
+        for gate_idx in enabled_gate_ids:
+            amap = attention_maps[gate_idx]
+            if amap is not None:
+                gate_maps[gate_idx].append(amap[0])
+
+    gate_ranges: dict[int, tuple[float, float]] = {}
+    for gate_idx in enabled_gate_ids:
+        flat = np.concatenate([m.reshape(-1) for m in gate_maps[gate_idx]], axis=0)
+        lo, hi = np.percentile(flat, map_percentiles)
+        if hi - lo < 1e-8:
+            lo = float(flat.min())
+            hi = float(flat.max())
+        if hi - lo < 1e-8:
+            hi = lo + 1e-8
+        gate_ranges[gate_idx] = (float(lo), float(hi))
+
+    last_im = None
+    for row, payload in enumerate(sample_payloads):
+        axes[row, 0].imshow(payload["image"])
+        axes[row, 1].imshow(payload["gt_overlay"])
+        axes[row, 2].imshow(payload["pred_overlay"])
+        axes[row, 0].set_ylabel(
+            f"#{payload['idx']}\ndice={payload['dice']:.3f}",
+            fontsize=10,
+        )
+
+        gate_col = 3
+        for gate_idx in enabled_gate_ids:
+            raw_map = payload["attention_maps"][gate_idx][0]
+            lo, hi = gate_ranges[gate_idx]
+            vis_map = np.clip((raw_map - lo) / max(hi - lo, 1e-8), 0.0, 1.0)
+            vis_map = np.power(vis_map, 0.7)
+
+            axes[row, gate_col].imshow(payload["image"])
+            last_im = axes[row, gate_col].imshow(
+                vis_map,
+                cmap="turbo",
+                alpha=0.60,
+                vmin=0.0,
+                vmax=1.0,
+            )
+            axes[row, gate_col].text(
+                0.02,
+                0.98,
+                f"mu={raw_map.mean():.4f}\nsd={raw_map.std():.4f}",
+                transform=axes[row, gate_col].transAxes,
+                ha="left",
+                va="top",
+                fontsize=9,
+                color="white",
+                bbox={"facecolor": "black", "alpha": 0.45, "pad": 2},
+            )
+            gate_col += 1
+
+    for ax in axes.flat:
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    if last_im is not None:
+        cax = fig.add_axes([0.935, 0.22, 0.012, 0.56])
+        fig.colorbar(
+            last_im,
+            cax=cax,
+            label=(
+                "Normalized gated-skip contribution\n"
+                "ReLU(sum_c(grad * gated_skip))"
+            ),
+        )
+
+    fig.suptitle(
+        f"{split} attention contribution maps ({which} checkpoint, threshold={pred_threshold:.2f})\n"
+        "red=ground truth, green=prediction; map = ReLU(sum_c(grad * gated_skip))",
+        fontsize=14,
+        y=0.98,
+    )
     return fig
 
 

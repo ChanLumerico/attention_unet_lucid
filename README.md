@@ -200,7 +200,7 @@ Because this repo only contains a train/validation split, the validation set fun
 - **Foreground Dice**: equivalent here because all validation masks contain foreground
 - **Prediction coverage ratio**: mean predicted positive area divided by image area
 
-For reproducibility, the values below were recomputed from the saved `best` checkpoint included in this repository using Python `3.14` and the local `lucid` package.
+For reproducibility, the values below were recomputed from the saved `latest` checkpoint included in this repository using Python `3.14` and the local `lucid` package.
 
 ## Quantitative Results
 
@@ -208,33 +208,34 @@ For reproducibility, the values below were recomputed from the saved `best` chec
 
 | Checkpoint | Threshold | Val Loss | Mean Dice | Median Dice | Dice Std | Mean IoU | Mean Predicted FG % | Mean Target FG % |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `best` | 0.20 | 0.6848 | 0.4117 | 0.4034 | 0.2330 | 0.2884 | 45.55 | 15.58 |
-| `best` | 0.50 | 0.6848 | 0.4488 | 0.4512 | 0.2313 | 0.3194 | 34.00 | 15.58 |
-| `best` | 0.60 | 0.6848 | **0.4549** | **0.4674** | 0.2305 | **0.3248** | 31.46 | 15.58 |
+| `latest` | 0.20 | 0.3037 | 0.7486 | 0.8253 | 0.2231 | 0.6409 | 14.60 | 15.58 |
+| `latest` | 0.50 | 0.3037 | 0.7470 | 0.8240 | 0.2282 | 0.6406 | 13.51 | 15.58 |
+| `latest` | 0.25 | 0.3037 | **0.7488** | **0.8314** | 0.2230 | **0.6415** | 14.36 | 15.58 |
 
 ### Threshold Sweep
 
-The model is quite sensitive to threshold choice:
+The `latest` checkpoint is comparatively stable across thresholds:
 
 | Threshold | Mean Dice | Mean IoU | Mean Predicted FG % |
 | ---: | ---: | ---: | ---: |
-| 0.10 | 0.3586 | 0.2440 | 59.73 |
-| 0.20 | 0.4117 | 0.2884 | 45.55 |
-| 0.30 | 0.4319 | 0.3054 | 40.03 |
-| 0.40 | 0.4417 | 0.3134 | 36.70 |
-| 0.50 | 0.4488 | 0.3194 | 34.00 |
-| 0.60 | **0.4549** | **0.3248** | 31.46 |
+| 0.10 | 0.7464 | 0.6374 | 15.35 |
+| 0.20 | 0.7486 | 0.6409 | 14.60 |
+| 0.30 | 0.7487 | 0.6417 | 14.16 |
+| 0.40 | 0.7480 | 0.6414 | 13.82 |
+| 0.50 | 0.7470 | 0.6406 | 13.51 |
+| 0.60 | 0.7461 | 0.6399 | 13.21 |
 
 ### Interpretation of the Results
 
 The main technical takeaway is not just the absolute Dice value, but the behavior of the system:
 
 - The model clearly learns meaningful lesion localization and shape structure.
-- The default threshold in the config (`0.20`) is aggressively recall-oriented and produces systematic over-segmentation.
-- Performance increases monotonically across the tested threshold range up to `0.60`, indicating that calibration/post-processing is still an open improvement lever.
-- Even at `0.60`, the model predicts substantially larger foreground area than the ground truth on average, so the network still tends to over-cover the lesion region.
+- The `latest` checkpoint performs much better than the previously documented `best` bundle that had been evaluated earlier in this README.
+- Threshold choice matters far less for `latest`: mean Dice remains tightly clustered around `0.746-0.749` across the full `0.10-0.60` sweep.
+- The best operating point in this sweep is shallow and occurs around `0.25`, not at the upper edge of the range.
+- Predicted foreground coverage is now close to the target foreground ratio, which indicates noticeably better calibration than the earlier over-segmenting result.
 
-In other words, the current training recipe is **functional but not yet calibrated**. For a framework validation repo, that is a useful finding because it surfaces model-behavior questions without exposing any instability in the data or training code.
+In other words, the `latest` model is not just functional; it is substantially better calibrated and materially stronger in overlap quality. For a framework validation repo, that is the more representative result to report because it shows the end state of the actual training run rather than an earlier, weaker checkpoint bundle.
 
 ## Qualitative Analysis
 
@@ -306,6 +307,35 @@ The diagnostic plots and overlay grids show that the model usually captures the 
     <img src="out/pred_overlay_grid.png" width="70%">
     <br>
     Figure 7. Test-Split Prediction Overlays (Red: GT, Green: Prediction)
+    <br>
+</div>
+
+### Attention Contribution Analysis
+
+To make the attention visualization more diagnostic than a raw gate-coefficient heatmap, I did not visualize the coefficient map $\alpha_l$ alone. Instead, I visualized the **class-conditional contribution of the gated skip signal** to the predicted foreground logit. For a gated skip tensor
+
+$$
+g_l = \alpha_l \odot x_l,
+$$
+
+the displayed contribution map is computed as
+
+$$
+M_l = \mathrm{ReLU}\left(\sum_c \frac{\partial s_{\mathrm{fg}}}{\partial g_{l,c}} \odot g_{l,c}\right),
+$$
+
+where $s_{\mathrm{fg}}$ is the foreground score aggregated over the predicted foreground region, $c$ indexes channels, and the final map is resized to input resolution and normalized per gate across the selected samples. Intuitively, this asks not only *where the gate is open*, but *which gated skip evidence actually supports the foreground segmentation decision*.
+
+This distinction matters. A raw attention coefficient can remain spatially smooth or weakly informative even when the model segments well, because it only measures how strongly skip features are allowed to pass. The contribution map above is closer to a class-conditional explanation: it highlights the parts of the gated skip stream that the decoder actively uses to construct the final lesion mask.
+
+For the `latest` checkpoint, the resulting maps show a reasonably coherent pattern. Gate 1 tends to distribute support over the lesion interior and coarse discriminative texture, while Gate 2 more consistently concentrates along lesion contours and outer shape refinement. In several cases the highest response forms a ring-like band around the polyp boundary, which is consistent with a decoder using later gated skip information to sharpen spatial extent and distinguish the lesion from surrounding mucosa. Importantly, the dominant response is usually localized to the lesion region rather than the full frame, which supports the claim that the learned attention pathway is contributing meaningful foreground-specific evidence rather than simply amplifying generic image contrast everywhere.
+
+At the same time, the figure also reveals residual failure modes. Some activation still appears around high-contrast non-lesion structures such as specular highlights, lumen boundaries, and sharp mucosal folds. That suggests the attention pathway is not purely semantic; it still inherits some sensitivity to strong local contrast and edge energy. From an evaluation standpoint, this is useful: it indicates that the model's attention mechanism is functioning and spatially selective in the `latest` checkpoint, but its inductive bias is still partly shared with classical boundary detectors rather than being perfectly lesion-exclusive.
+
+<div align="center">
+    <img src="out/attention_map_grid_latest_contrib.png" width="90%">
+    <br>
+    Figure 8. Gated-Skip Contribution Maps for the Latest Checkpoint
     <br>
 </div>
 
