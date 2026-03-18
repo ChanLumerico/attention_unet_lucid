@@ -10,11 +10,11 @@ From a portfolio perspective, this project is meant to demonstrate three things:
 
 ## Abstract
 
-<div align="center">
-    <img src="https://github.com/user-attachments/assets/0289d7c5-fa11-4b6f-8ce3-235c357858b9" width=70%">
-</div>
-
 I trained an **Attention U-Net** style 2D segmentation model on the **Kvasir-SEG** polyp segmentation dataset to evaluate whether `lucid` is stable and expressive enough for a practical encoder-decoder medical vision task. The full pipeline includes deterministic data preprocessing, synchronized geometric augmentation for image-mask pairs, YAML-driven experiment configuration, checkpointed training, and post-hoc prediction diagnostics.
+
+<div align="center">
+    <img src="https://github.com/user-attachments/assets/0289d7c5-fa11-4b6f-8ce3-235c357858b9" width=60%">
+</div>
 
 The final model has **21.7M parameters** and was trained on **800 training** images with evaluation on **200 validation** images. With the repository's configured inference threshold of **0.20**, the saved `best` checkpoint reaches **0.412 mean Dice** and **0.288 mean IoU** on the validation split. A threshold sweep on the saved logits indicates that the same checkpoint reaches its best validation operating point near **0.60**, where performance improves to **0.455 mean Dice** and **0.325 mean IoU**.
 
